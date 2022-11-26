@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     error::Error,
     io::{Read, Write},
@@ -12,7 +13,7 @@ type R<T> = Result<T, Box<dyn Error>>;
 fn main() -> R<()> {
     let mut proxy = None;
     let mut listen_port = 3128;
-    let mut hosts = Vec::new();
+    let mut hosts = HashSet::new();
     let mut debug = false;
     let mut args = env::args().skip(1);
 
@@ -63,7 +64,7 @@ fn main() -> R<()> {
     println!("Listening port {listen_port}");
     println!();
 
-    let hosts = &*hosts.leak();
+    let hosts = &*Box::leak(Box::new(hosts));
 
     for stream in server.incoming() {
         let stream = match stream {
@@ -89,7 +90,7 @@ fn main() -> R<()> {
     Ok(())
 }
 
-fn handle(client: TcpStream, proxy: &SocketAddr, hosts: &[String], debug: bool) -> R<()> {
+fn handle(client: TcpStream, proxy: &SocketAddr, hosts: &HashSet<String>, debug: bool) -> R<()> {
     if !check_http_get(&client)? {
         if debug {
             eprintln!("Error: not HTTP GET.");
@@ -116,7 +117,7 @@ fn check_http_get(client: &TcpStream) -> R<bool> {
 fn resolve_host(
     client: &TcpStream,
     proxy: &SocketAddr,
-    hosts: &[String],
+    hosts: &HashSet<String>,
     debug: bool,
 ) -> R<Option<SocketAddr>> {
     let mut buf = [0u8; 1024];
@@ -140,7 +141,7 @@ fn resolve_host(
     }
     .trim();
 
-    if hosts.iter().any(|s| s == addr) {
+    if hosts.contains(addr) {
         if debug {
             println!("{addr} => PROXY");
         }
