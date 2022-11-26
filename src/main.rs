@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     str, thread,
+    time::Duration,
 };
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -163,35 +164,31 @@ fn resolve_host(
 }
 
 fn transfer_data(mut client: TcpStream, mut server: TcpStream) -> R<()> {
-    let mut buf = [0u8; 4096];
+    client.set_read_timeout(Some(Duration::from_millis(1)))?;
+    let mut buf = [0u8; 1024];
 
     loop {
-        loop {
-            let count = client.read(buf.as_mut_slice())?;
+        let count = client.read(buf.as_mut_slice())?;
+        server.write_all(&buf[..count])?;
 
-            if count == 0 {
-                return Ok(());
-            }
-
-            server.write_all(&buf[..count])?;
-
-            if count < buf.len() {
-                break;
-            }
-        }
-
-        loop {
-            let count = server.read(buf.as_mut_slice())?;
-
-            if count == 0 {
-                return Ok(());
-            }
-
-            client.write_all(&buf[..count])?;
-
-            if count < buf.len() {
-                break;
-            }
+        if count < buf.len() {
+            break;
         }
     }
+
+    loop {
+        let count = server.read(buf.as_mut_slice())?;
+
+        if count == 0 {
+            break;
+        }
+
+        client.write_all(&buf[..count])?;
+
+        if count < buf.len() && client.read([0u8; 1].as_mut_slice()).is_ok() {
+            break;
+        }
+    }
+
+    Ok(())
 }
