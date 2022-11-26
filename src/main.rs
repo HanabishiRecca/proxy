@@ -37,7 +37,10 @@ fn main() -> R<()> {
             "-d" => {
                 debug = true;
             }
-            _ => {}
+            _ => {
+                eprintln!("Unknown option '{arg}'.");
+                return Ok(());
+            }
         }
     }
 
