@@ -3,7 +3,7 @@ use std::{
     error::Error,
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
-    str,
+    str, thread,
 };
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -62,11 +62,27 @@ fn main() -> R<()> {
     println!("Listening port {listen_port}");
     println!();
 
+    let hosts = &*hosts.leak();
+
     for stream in server.incoming() {
-        match handle(stream?, &proxy, hosts.as_slice(), debug) {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                if debug {
+                    eprintln!("Error: {e}");
+                }
+                continue;
+            }
+        };
+
+        thread::spawn(move || match handle(stream, &proxy, hosts, debug) {
             Ok(_) => {}
-            Err(e) => eprintln!("Error: {e}"),
-        }
+            Err(e) => {
+                if debug {
+                    eprintln!("Error: {e}")
+                }
+            }
+        });
     }
 
     Ok(())
