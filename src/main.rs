@@ -1,16 +1,27 @@
 use std::{
     collections::HashSet,
     env,
-    error::Error,
-    io::{Read, Write},
+    io::{Error as IOError, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    process::ExitCode,
     str, thread,
     time::Duration,
 };
 
-type R<T> = Result<T, Box<dyn Error>>;
+mod error;
+use crate::error::*;
 
-fn main() -> R<()> {
+fn main() -> ExitCode {
+    match start() {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            err(e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn start() -> Result<(), AppError> {
     let mut proxy = None;
     let mut listen_port = 3128;
     let mut hosts = HashSet::new();
@@ -18,40 +29,47 @@ fn main() -> R<()> {
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
+        macro_rules! next {
+            () => {
+                match args.next() {
+                    Some(value) => value,
+                    None => E!(ArgError::NoValue(arg)),
+                }
+            };
+        }
+        macro_rules! parse {
+            ($value: expr) => {
+                match $value {
+                    Ok(value) => value,
+                    Err(_) => E!(ArgError::WrongValue(arg)),
+                }
+            };
+        }
         match arg.as_str() {
             "-p" => {
-                if let Some(value) = args.next() {
-                    proxy = value.to_socket_addrs()?.next();
-                }
+                proxy = parse!(next!().to_socket_addrs()).next();
             }
             "-l" => {
-                if let Some(value) = args.next() {
-                    listen_port = value.parse()?;
-                }
+                listen_port = parse!(next!().parse());
             }
             "-h" => {
-                if let Some(value) = args.next() {
-                    hosts = value.split(',').map(|s| s.trim().to_owned()).collect();
-                }
+                hosts = next!().split(',').map(|s| s.trim().to_owned()).collect();
             }
             "-d" => {
                 debug = true;
             }
             _ => {
-                eprintln!("Unknown option '{arg}'.");
-                return Ok(());
+                E!(ArgError::Unknown(arg));
             }
         }
     }
 
     let Some(proxy) = proxy else {
-        eprintln!("Error: proxy server not specified.");
-        return Ok(());
+        E!(AppError::NoProxy);
     };
 
     if hosts.is_empty() {
-        eprintln!("Error: target hosts not specified.");
-        return Ok(());
+        E!(AppError::NoHosts);
     }
 
     println!("Proxy {proxy}");
@@ -74,17 +92,16 @@ fn main() -> R<()> {
             Ok(s) => s,
             Err(e) => {
                 if debug {
-                    eprintln!("Error: {e}");
+                    err(e);
                 }
                 continue;
             }
         };
 
-        thread::spawn(move || match handle(stream, &proxy, hosts, debug) {
-            Ok(_) => {}
-            Err(e) => {
+        thread::spawn(move || {
+            if let Err(e) = handle(stream, &proxy, hosts, debug) {
                 if debug {
-                    eprintln!("Error: {e}")
+                    err(e);
                 }
             }
         });
@@ -93,25 +110,22 @@ fn main() -> R<()> {
     Ok(())
 }
 
-fn handle(client: TcpStream, proxy: &SocketAddr, hosts: &HashSet<String>, debug: bool) -> R<()> {
+fn handle(
+    client: TcpStream,
+    proxy: &SocketAddr,
+    hosts: &HashSet<String>,
+    debug: bool,
+) -> Result<(), ConnError> {
     if !check_http_get(&client)? {
-        if debug {
-            eprintln!("Error: not HTTP GET.");
-        }
-        return Ok(());
+        E!(ConnError::NotHttp);
     }
 
-    let Some(addr) = resolve_host(&client, proxy, hosts, debug)? else {
-        if debug {
-            eprintln!("Error: no host header.");
-        }
-        return Ok(());
-    };
-
-    transfer_data(client, TcpStream::connect(addr)?)
+    let addr = resolve_host(&client, proxy, hosts, debug)?;
+    transfer_data(client, TcpStream::connect(addr)?)?;
+    Ok(())
 }
 
-fn check_http_get(client: &TcpStream) -> R<bool> {
+fn check_http_get(client: &TcpStream) -> Result<bool, IOError> {
     let mut head = [0u8; 3];
     client.peek(head.as_mut_slice())?;
     Ok(head == *b"GET")
@@ -122,7 +136,7 @@ fn resolve_host(
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
     debug: bool,
-) -> R<Option<SocketAddr>> {
+) -> Result<SocketAddr, ConnError> {
     let mut buf = [0u8; 1024];
 
     let chunk = {
@@ -133,7 +147,7 @@ fn resolve_host(
     const HOST_HEADER: &str = "Host: ";
 
     let Some(index) = chunk.find(HOST_HEADER) else {
-        return Ok(None);
+        E!(ConnError::ParseError);
     };
 
     let chunk = &chunk[index + HOST_HEADER.len()..];
@@ -149,7 +163,7 @@ fn resolve_host(
             println!("{addr} => PROXY");
         }
 
-        Ok(Some(*proxy))
+        Ok(*proxy)
     } else {
         if debug {
             println!("{addr} => DIRECT");
@@ -163,11 +177,14 @@ fn resolve_host(
             (addr, 80).to_socket_addrs()
         };
 
-        Ok(addrs?.next())
+        match addrs?.next() {
+            Some(a) => Ok(a),
+            None => Err(ConnError::ParseError),
+        }
     }
 }
 
-fn transfer_data(mut client: TcpStream, mut server: TcpStream) -> R<()> {
+fn transfer_data(mut client: TcpStream, mut server: TcpStream) -> Result<(), IOError> {
     client.set_read_timeout(Some(Duration::from_millis(1)))?;
     let mut buf = [0u8; 1024];
 
