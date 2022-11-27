@@ -9,7 +9,7 @@ use std::{
 };
 
 mod error;
-use crate::error::*;
+use error::*;
 
 fn main() -> ExitCode {
     match start() {
@@ -33,7 +33,7 @@ fn start() -> Result<(), AppError> {
             () => {
                 match args.next() {
                     Some(value) => value,
-                    None => E!(ArgError::NoValue(arg)),
+                    _ => E!(ArgError::NoValue(arg)),
                 }
             };
         }
@@ -41,7 +41,7 @@ fn start() -> Result<(), AppError> {
             ($value: expr) => {
                 match $value {
                     Ok(value) => value,
-                    Err(_) => E!(ArgError::WrongValue(arg)),
+                    _ => E!(ArgError::WrongValue(arg)),
                 }
             };
         }
@@ -126,10 +126,13 @@ fn handle(
 }
 
 fn check_http_get(client: &TcpStream) -> Result<bool, IOError> {
-    let mut head = [0u8; 3];
+    const GET: &[u8] = b"GET";
+    let mut head = [0u8; GET.len()];
     client.peek(head.as_mut_slice())?;
-    Ok(head == *b"GET")
+    Ok(head == GET)
 }
+
+const TCP_MSS: usize = 1280;
 
 fn resolve_host(
     client: &TcpStream,
@@ -137,56 +140,58 @@ fn resolve_host(
     hosts: &HashSet<String>,
     debug: bool,
 ) -> Result<SocketAddr, ConnError> {
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; TCP_MSS];
 
-    let chunk = {
-        let count = client.peek(buf.as_mut_slice())?;
-        str::from_utf8(&buf[..count])?
+    let addr = {
+        let content = {
+            let count = client.peek(buf.as_mut_slice())?;
+            str::from_utf8(&buf[..count])?
+        };
+
+        const HOST_HEADER: &str = "\nHost:";
+
+        let s = match content.find(HOST_HEADER) {
+            Some(pos) => &content[(pos + HOST_HEADER.len())..],
+            _ => E!(ConnError::ParseError),
+        };
+
+        match s.find('\n') {
+            Some(pos) => &s[..pos],
+            _ => E!(ConnError::ParseError),
+        }
+        .trim()
     };
-
-    const HOST_HEADER: &str = "Host: ";
-
-    let Some(index) = chunk.find(HOST_HEADER) else {
-        E!(ConnError::ParseError);
-    };
-
-    let chunk = &chunk[index + HOST_HEADER.len()..];
-
-    let addr = match chunk.find('\n') {
-        Some(end) => &chunk[..end],
-        None => chunk,
-    }
-    .trim();
 
     if hosts.contains(addr) {
         if debug {
             println!("{addr} => PROXY");
         }
+        return Ok(*proxy);
+    }
 
-        Ok(*proxy)
-    } else {
-        if debug {
-            println!("{addr} => DIRECT");
-        }
+    if debug {
+        println!("{addr} => DIRECT");
+    }
 
+    if let Ok(mut addrs) = {
         let v6 = addr.starts_with('[');
-
-        let addrs = if (v6 && addr.contains("]:")) || (!v6 && addr.contains(':')) {
+        if (v6 && addr.contains("]:")) || (!v6 && addr.contains(':')) {
             addr.to_socket_addrs()
         } else {
             (addr, 80).to_socket_addrs()
-        };
-
-        match addrs?.next() {
-            Some(a) => Ok(a),
-            None => Err(ConnError::ParseError),
+        }
+    } {
+        if let Some(a) = addrs.next() {
+            return Ok(a);
         }
     }
+
+    E!(ConnError::ParseError)
 }
 
 fn transfer_data(mut client: TcpStream, mut server: TcpStream) -> Result<(), IOError> {
     client.set_read_timeout(Some(Duration::from_millis(1)))?;
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; TCP_MSS];
 
     loop {
         let count = client.read(buf.as_mut_slice())?;
