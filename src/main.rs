@@ -87,9 +87,9 @@ fn start() -> Result<(), AppError> {
 
     let hosts = &*Box::leak(Box::new(hosts));
 
-    for stream in server.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
+    loop {
+        let client = match server.accept() {
+            Ok((c, _)) => c,
             Err(e) => {
                 if debug {
                     err(e);
@@ -99,15 +99,13 @@ fn start() -> Result<(), AppError> {
         };
 
         thread::spawn(move || {
-            if let Err(e) = handle(stream, &proxy, hosts, debug) {
+            if let Err(e) = handle(client, &proxy, hosts, debug) {
                 if debug {
                     err(e);
                 }
             }
         });
     }
-
-    Ok(())
 }
 
 fn handle(
