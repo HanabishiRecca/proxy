@@ -114,12 +114,15 @@ fn handle(
     hosts: &HashSet<String>,
     debug: bool,
 ) -> Result<(), ConnError> {
+    client.set_nodelay(true)?;
+
     if !check_http_get(&client)? {
         E!(ConnError::NotHttp);
     }
 
-    let addr = resolve_host(&client, proxy, hosts, debug)?;
-    transfer_data(client, TcpStream::connect(addr)?)?;
+    let server = TcpStream::connect(resolve_host(&client, proxy, hosts, debug)?)?;
+    server.set_nodelay(true)?;
+    transfer_data(client, server)?;
     Ok(())
 }
 
