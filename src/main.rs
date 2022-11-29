@@ -1,10 +1,12 @@
 use std::{
     collections::HashSet,
     env,
-    io::{Error as IOError, Read, Write},
+    io::{ErrorKind::WouldBlock, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     process::ExitCode,
-    str, thread,
+    str,
+    sync::Mutex,
+    thread,
     time::Duration,
 };
 
@@ -21,10 +23,29 @@ fn main() -> ExitCode {
     }
 }
 
+enum State {
+    Send,
+    Recv,
+    Done,
+}
+
+struct Connection {
+    client: TcpStream,
+    server: Option<TcpStream>,
+    state: State,
+}
+
+const MAX_WORKER_THREADS: usize = 128;
+const WORKER_DELAY: Duration = Duration::from_millis(1);
+const TCP_MSS: usize = 1280;
+const GET: &[u8] = b"GET";
+const HOST_HEADER: &str = "\nHost:";
+
 fn start() -> Result<(), AppError> {
     let mut proxy = None;
     let mut listen_port = 3128;
     let mut hosts = HashSet::new();
+    let mut worker_threads = 1;
     let mut debug = false;
     let mut args = env::args().skip(1);
 
@@ -55,6 +76,16 @@ fn start() -> Result<(), AppError> {
             "-h" => {
                 hosts = next!().split(',').map(|s| s.trim().to_owned()).collect();
             }
+            "-t" => {
+                worker_threads = match parse!(next!().parse()) {
+                    0 => match thread::available_parallelism() {
+                        Ok(n) => n.get(),
+                        _ => 1,
+                    },
+                    n => n,
+                }
+                .min(MAX_WORKER_THREADS);
+            }
             "-d" => {
                 debug = true;
             }
@@ -76,80 +107,160 @@ fn start() -> Result<(), AppError> {
     println!();
     println!("Hosts:");
 
-    for host in &hosts {
+    let hosts = &*Box::leak(Box::new(hosts));
+
+    for host in hosts {
         println!("  {host}");
     }
 
     let server = TcpListener::bind((Ipv4Addr::UNSPECIFIED, listen_port))?;
     println!();
     println!("Listening port {listen_port}");
+
+    let workers = &*(0..worker_threads)
+        .map(|_| Mutex::new(Vec::new()))
+        .collect::<Vec<_>>()
+        .leak();
+
+    println!("Worker threads: {}", workers.len());
     println!();
 
-    let hosts = &*Box::leak(Box::new(hosts));
+    for worker in workers {
+        thread::spawn(move || run_worker_thread(worker, proxy, hosts, debug));
+    }
 
     loop {
-        let client = match server.accept() {
-            Ok((c, _)) => c,
-            Err(e) => {
-                if debug {
-                    err(e);
-                }
-                continue;
-            }
-        };
+        for worker in workers {
+            let (client, _) = server.accept()?;
+            client.set_nonblocking(true)?;
+            client.set_nodelay(true)?;
 
-        thread::spawn(move || {
-            if let Err(e) = handle(client, &proxy, hosts, debug) {
-                if debug {
-                    err(e);
-                }
-            }
-        });
+            let Ok(mut connections) = worker.lock() else {
+                E!(AppError::Unknown);
+            };
+
+            connections.push(Connection {
+                client,
+                server: None,
+                state: State::Send,
+            });
+        }
     }
 }
 
-fn handle(
-    client: TcpStream,
+fn run_worker_thread(
+    worker: &Mutex<Vec<Connection>>,
+    proxy: SocketAddr,
+    hosts: &HashSet<String>,
+    debug: bool,
+) {
+    let mut buf = [0u8; TCP_MSS];
+
+    loop {
+        thread::sleep(WORKER_DELAY);
+
+        let Ok(mut connections) = worker.try_lock() else {
+            continue;
+        };
+
+        if connections.len() == 0 {
+            continue;
+        }
+
+        handle_connections(&mut connections, &mut buf, &proxy, hosts, debug);
+    }
+}
+
+fn handle_connections(
+    connections: &mut Vec<Connection>,
+    buf: &mut [u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
     debug: bool,
-) -> Result<(), ConnError> {
-    client.set_nodelay(true)?;
+) {
+    let mut index = 0;
 
-    if !check_http_get(&client)? {
+    while index < connections.len() {
+        let done = {
+            let Some(connection) = connections.get_mut(index) else {
+                index += 1;
+                continue;
+            };
+
+            match progress(connection, buf, proxy, hosts, debug) {
+                Ok(d) => d,
+                Err(e) => {
+                    err(e);
+                    true
+                }
+            }
+        };
+
+        if !done {
+            index += 1;
+            continue;
+        }
+
+        let Some(last) = connections.pop() else {
+            index += 1;
+            continue;
+        };
+
+        if index >= connections.len() {
+            break;
+        }
+
+        connections[index] = last;
+        index += 1;
+    }
+}
+
+fn progress(
+    connection: &mut Connection,
+    buf: &mut [u8],
+    proxy: &SocketAddr,
+    hosts: &HashSet<String>,
+    debug: bool,
+) -> Result<bool, ConnError> {
+    use State::*;
+
+    while match connection.state {
+        Send => send(connection, buf, proxy, hosts, debug)?,
+        Recv => recv(connection, buf)?,
+        Done => return Ok(true),
+    } {}
+
+    Ok(false)
+}
+
+fn init(
+    buf: &[u8],
+    proxy: &SocketAddr,
+    hosts: &HashSet<String>,
+    debug: bool,
+) -> Result<TcpStream, ConnError> {
+    if !check_http(buf) {
         E!(ConnError::NotHttp);
     }
 
-    let server = TcpStream::connect(resolve_host(&client, proxy, hosts, debug)?)?;
+    let server = TcpStream::connect(resolve(buf, proxy, hosts, debug)?)?;
+    server.set_nonblocking(true)?;
     server.set_nodelay(true)?;
-    transfer_data(client, server)?;
-    Ok(())
+    Ok(server)
 }
 
-fn check_http_get(client: &TcpStream) -> Result<bool, IOError> {
-    const GET: &[u8] = b"GET";
-    let mut head = [0u8; GET.len()];
-    client.peek(head.as_mut_slice())?;
-    Ok(head == GET)
+fn check_http(buf: &[u8]) -> bool {
+    (buf.len() > GET.len()) && (&buf[..GET.len()] == GET)
 }
 
-const TCP_MSS: usize = 1280;
-
-fn resolve_host(
-    client: &TcpStream,
+fn resolve(
+    buf: &[u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
     debug: bool,
 ) -> Result<SocketAddr, ConnError> {
-    let mut buf = [0u8; TCP_MSS];
-
     let addr = {
-        let content = {
-            let count = client.peek(buf.as_mut_slice())?;
-            str::from_utf8(&buf[..count])?
-        };
-
-        const HOST_HEADER: &str = "\nHost:";
+        let content = str::from_utf8(buf)?;
 
         let s = match content.find(HOST_HEADER) {
             Some(pos) => &content[(pos + HOST_HEADER.len())..],
@@ -190,32 +301,52 @@ fn resolve_host(
     E!(ConnError::ParseError)
 }
 
-fn transfer_data(mut client: TcpStream, mut server: TcpStream) -> Result<(), IOError> {
-    client.set_read_timeout(Some(Duration::from_millis(1)))?;
-    let mut buf = [0u8; TCP_MSS];
+fn send(
+    connection: &mut Connection,
+    buf: &mut [u8],
+    proxy: &SocketAddr,
+    hosts: &HashSet<String>,
+    debug: bool,
+) -> Result<bool, ConnError> {
+    let Ok(count) = connection.client.read(buf) else {
+        return Ok(false);
+    };
 
-    loop {
-        let count = client.read(buf.as_mut_slice())?;
-        server.write_all(&buf[..count])?;
+    connection
+        .server
+        .get_or_insert(init(&buf[..count], proxy, hosts, debug)?)
+        .write_all(&buf[..count])?;
 
-        if count < buf.len() {
-            break;
-        }
+    if count < buf.len() {
+        connection.state = State::Recv;
+        connection.client.set_read_timeout(Some(WORKER_DELAY))?;
     }
 
-    loop {
-        let count = server.read(buf.as_mut_slice())?;
+    Ok(true)
+}
 
-        if count == 0 {
-            break;
-        }
+fn recv(connection: &mut Connection, buf: &mut [u8]) -> Result<bool, ConnError> {
+    let Some(server) = &mut connection.server else {
+        E!(ConnError::Unknown);
+    };
 
-        client.write_all(&buf[..count])?;
-
-        if count < buf.len() && client.read([0u8; 1].as_mut_slice()).is_ok() {
-            break;
-        }
+    if match connection.client.peek([0u8; 1].as_mut_slice()) {
+        Ok(c) => c == 0,
+        Err(e) => !matches!(e.kind(), WouldBlock),
+    } {
+        connection.state = State::Done;
+        return Ok(true);
     }
 
-    Ok(())
+    let Ok(count) = server.read(buf) else {
+        return Ok(false);
+    };
+
+    if count == 0 {
+        connection.state = State::Done;
+        return Ok(true);
+    }
+
+    connection.client.write_all(&buf[..count])?;
+    Ok(true)
 }
