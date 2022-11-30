@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     io::{ErrorKind::WouldBlock, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
@@ -124,9 +124,10 @@ fn start() -> Result<(), AppError> {
 
     println!("Worker threads: {}", workers.len());
     println!();
+    let dns_cache = &*Box::leak(Box::new(Mutex::new(HashMap::<String, SocketAddr>::new())));
 
     for worker in workers {
-        thread::spawn(move || run_worker_thread(worker, proxy, hosts, debug));
+        thread::spawn(move || run_worker_thread(worker, proxy, hosts, dns_cache, debug));
     }
 
     loop {
@@ -152,6 +153,7 @@ fn run_worker_thread(
     worker: &Mutex<Vec<Connection>>,
     proxy: SocketAddr,
     hosts: &HashSet<String>,
+    dns_cache: &Mutex<HashMap<String, SocketAddr>>,
     debug: bool,
 ) {
     let mut buf = [0u8; TCP_MSS];
@@ -167,7 +169,7 @@ fn run_worker_thread(
             continue;
         }
 
-        handle_connections(&mut connections, &mut buf, &proxy, hosts, debug);
+        handle_connections(&mut connections, &mut buf, &proxy, hosts, dns_cache, debug);
     }
 }
 
@@ -176,6 +178,7 @@ fn handle_connections(
     buf: &mut [u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
+    dns_cache: &Mutex<HashMap<String, SocketAddr>>,
     debug: bool,
 ) {
     let mut index = 0;
@@ -187,7 +190,7 @@ fn handle_connections(
                 continue;
             };
 
-            match progress(connection, buf, proxy, hosts, debug) {
+            match progress(connection, buf, proxy, hosts, dns_cache, debug) {
                 Ok(d) => d,
                 Err(e) => {
                     err(e);
@@ -220,12 +223,13 @@ fn progress(
     buf: &mut [u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
+    dns_cache: &Mutex<HashMap<String, SocketAddr>>,
     debug: bool,
 ) -> Result<bool, ConnError> {
     use State::*;
 
     while match connection.state {
-        Send => send(connection, buf, proxy, hosts, debug)?,
+        Send => send(connection, buf, proxy, hosts, dns_cache, debug)?,
         Recv => recv(connection, buf)?,
         Done => return Ok(true),
     } {}
@@ -237,13 +241,14 @@ fn init(
     buf: &[u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
+    dns_cache: &Mutex<HashMap<String, SocketAddr>>,
     debug: bool,
 ) -> Result<TcpStream, ConnError> {
     if !check_http(buf) {
         E!(ConnError::NotHttp);
     }
 
-    let server = TcpStream::connect(resolve(buf, proxy, hosts, debug)?)?;
+    let server = TcpStream::connect(resolve(buf, proxy, hosts, dns_cache, debug)?)?;
     server.set_nonblocking(true)?;
     server.set_nodelay(true)?;
     Ok(server)
@@ -257,6 +262,7 @@ fn resolve(
     buf: &[u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
+    dns_cache: &Mutex<HashMap<String, SocketAddr>>,
     debug: bool,
 ) -> Result<SocketAddr, ConnError> {
     let addr = {
@@ -285,6 +291,19 @@ fn resolve(
         println!("{addr} => DIRECT");
     }
 
+    macro_rules! L {
+        () => {
+            match dns_cache.lock() {
+                Ok(v) => v,
+                _ => E!(ConnError::Unknown),
+            }
+        };
+    }
+
+    if let Some(cached) = L!().get(addr) {
+        return Ok(*cached);
+    }
+
     if let Ok(mut addrs) = {
         let v6 = addr.starts_with('[');
         if (v6 && addr.contains("]:")) || (!v6 && addr.contains(':')) {
@@ -294,6 +313,7 @@ fn resolve(
         }
     } {
         if let Some(a) = addrs.next() {
+            L!().insert(addr.to_owned(), a);
             return Ok(a);
         }
     }
@@ -306,6 +326,7 @@ fn send(
     buf: &mut [u8],
     proxy: &SocketAddr,
     hosts: &HashSet<String>,
+    dns_cache: &Mutex<HashMap<String, SocketAddr>>,
     debug: bool,
 ) -> Result<bool, ConnError> {
     let Ok(count) = connection.client.read(buf) else {
@@ -314,7 +335,7 @@ fn send(
 
     connection
         .server
-        .get_or_insert(init(&buf[..count], proxy, hosts, debug)?)
+        .get_or_insert(init(&buf[..count], proxy, hosts, dns_cache, debug)?)
         .write_all(&buf[..count])?;
 
     if count < buf.len() {
