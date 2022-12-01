@@ -10,3 +10,4 @@ strip = 'symbols'
 lto = true
 
 [dependencies]
+mio = { version = "0.8", features = ["net", "os-poll"] }

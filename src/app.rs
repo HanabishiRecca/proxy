@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{ErrorKind::WouldBlock, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    io::{ErrorKind, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs},
     str,
     sync::{Mutex, MutexGuard},
     thread,
     time::Duration,
 };
+
+use mio::net::TcpStream;
 
 use crate::{error::*, E};
 
@@ -86,9 +88,9 @@ impl App {
 
         connections.push(Connection {
             app: worker.app,
-            client,
+            client: TcpStream::from_std(client),
             server: None,
-            state: State::Send,
+            state: State::Init,
         });
 
         Ok(())
@@ -135,7 +137,9 @@ impl<'a> Worker<'a> {
                 match connection.progress() {
                     Ok(d) => d,
                     Err(e) => {
-                        err(e);
+                        if self.app.debug {
+                            err(e);
+                        }
                         true
                     }
                 }
@@ -167,6 +171,8 @@ struct Connection<'a> {
 }
 
 enum State {
+    Init,
+    Conn,
     Send,
     Recv,
     Done,
@@ -177,6 +183,8 @@ impl<'a> Connection<'a> {
         use State::*;
 
         while match self.state {
+            Init => self.init()?,
+            Conn => self.connect()?,
             Send => self.send()?,
             Recv => self.recv()?,
             Done => return Ok(true),
@@ -185,15 +193,23 @@ impl<'a> Connection<'a> {
         Ok(false)
     }
 
-    fn init(&self, data: &[u8]) -> Result<TcpStream, ConnError> {
+    fn init(&mut self) -> Result<bool, ConnError> {
+        let mut buf = [0u8; TCP_MSS];
+
+        let Ok(count) = self.client.peek(buf.as_mut_slice()) else {
+            return Ok(false);
+        };
+
+        let data = &buf[..count];
+
         if !Self::check_http(data) {
             E!(ConnError::NotHttp);
         }
 
         let server = TcpStream::connect(self.resolve(data)?)?;
-        server.set_nonblocking(true)?;
-        server.set_nodelay(true)?;
-        Ok(server)
+        self.server = Some(server);
+        self.state = State::Conn;
+        Ok(true)
     }
 
     fn check_http(data: &[u8]) -> bool {
@@ -230,6 +246,23 @@ impl<'a> Connection<'a> {
         self.app.dns.resolve(host)
     }
 
+    fn connect(&mut self) -> Result<bool, ConnError> {
+        let Some(server) = &self.server else {
+            E!(ConnError::Unknown);
+        };
+
+        if let Err(e) = server.peer_addr() {
+            if matches!(e.kind(), ErrorKind::NotConnected | ErrorKind::WouldBlock) {
+                return Ok(false);
+            }
+            E!(e);
+        }
+
+        server.set_nodelay(true)?;
+        self.state = State::Send;
+        Ok(true)
+    }
+
     fn send(&mut self) -> Result<bool, ConnError> {
         let mut buf = [0u8; TCP_MSS];
 
@@ -237,13 +270,19 @@ impl<'a> Connection<'a> {
             return Ok(false);
         };
 
-        self.server
-            .get_or_insert(self.init(&buf[..count])?)
-            .write_all(&buf[..count])?;
+        if count == 0 {
+            self.state = State::Recv;
+            return Ok(true);
+        }
+
+        let Some(server) = &mut self.server else {
+            E!(ConnError::Unknown);
+        };
+
+        server.write_all(&buf[..count])?;
 
         if count < buf.len() {
             self.state = State::Recv;
-            self.client.set_read_timeout(Some(WORKER_DELAY))?;
         }
 
         Ok(true)
@@ -258,7 +297,7 @@ impl<'a> Connection<'a> {
 
         if match self.client.peek([0u8; 1].as_mut_slice()) {
             Ok(c) => c == 0,
-            Err(e) => !matches!(e.kind(), WouldBlock),
+            Err(e) => e.kind() != ErrorKind::WouldBlock,
         } {
             self.state = State::Done;
             return Ok(true);
