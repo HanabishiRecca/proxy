@@ -18,11 +18,39 @@ pub fn err(e: impl Error) {
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum AppError {
-    NoProxy,
-    NoHosts,
-    Unknown,
+pub enum MainError {
     ArgError(ArgError),
+    AppError(AppError),
+}
+
+impl Error for MainError {}
+
+impl Display for MainError {
+    fn fmt(&self, f: &mut Formatter) -> Result {
+        use MainError::*;
+        match self {
+            ArgError(e) => e.fmt(f),
+            AppError(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<AppError> for MainError {
+    fn from(e: AppError) -> Self {
+        Self::AppError(e)
+    }
+}
+
+impl From<ArgError> for MainError {
+    fn from(e: ArgError) -> Self {
+        Self::ArgError(e)
+    }
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum AppError {
+    Unknown,
     IOError(IOError),
 }
 
@@ -32,18 +60,9 @@ impl Display for AppError {
     fn fmt(&self, f: &mut Formatter) -> Result {
         use AppError::*;
         match self {
-            NoProxy => write!(f, "proxy server not specified"),
-            NoHosts => write!(f, "target hosts not specified"),
             Unknown => write!(f, "an unknown error occured"),
-            ArgError(e) => e.fmt(f),
             IOError(e) => e.fmt(f),
         }
-    }
-}
-
-impl From<ArgError> for AppError {
-    fn from(e: ArgError) -> Self {
-        Self::ArgError(e)
     }
 }
 
@@ -56,6 +75,8 @@ impl From<IOError> for AppError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ArgError {
+    NoProxy,
+    NoHosts,
     NoValue(String),
     WrongValue(String),
     Unknown(String),
@@ -67,6 +88,8 @@ impl Display for ArgError {
     fn fmt(&self, f: &mut Formatter) -> Result {
         use ArgError::*;
         match self {
+            NoProxy => write!(f, "proxy server not specified"),
+            NoHosts => write!(f, "target hosts not specified"),
             NoValue(arg) => write!(f, "option '{arg}' requires value"),
             WrongValue(arg) => write!(f, "wrong value for option '{arg}'"),
             Unknown(arg) => write!(f, "unknown option '{arg}'"),
@@ -79,6 +102,7 @@ impl Display for ArgError {
 pub enum ConnError {
     NotHttp,
     ParseError,
+    DnsError,
     Unknown,
     IOError(IOError),
 }
@@ -91,6 +115,7 @@ impl Display for ConnError {
         match self {
             NotHttp => write!(f, "not HTTP GET request"),
             ParseError => write!(f, "unable to parse request"),
+            DnsError => write!(f, "unable to resolve host"),
             Unknown => write!(f, "an unknown error occured"),
             IOError(e) => e.fmt(f),
         }
