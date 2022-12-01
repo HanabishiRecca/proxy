@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{ErrorKind, Read, Write},
+    mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs},
     str,
     sync::{Mutex, MutexGuard},
@@ -14,7 +15,7 @@ use crate::{error::*, E};
 
 const MAX_WORKER_THREADS: usize = 128;
 const WORKER_DELAY: Duration = Duration::from_millis(1);
-const TCP_MSS: usize = 1280;
+const BUFFER_SIZE: usize = 4096;
 const GET: &[u8] = b"GET";
 const HOST_HEADER: &str = "\nHost:";
 
@@ -194,7 +195,7 @@ impl<'a> Connection<'a> {
     }
 
     fn init(&mut self) -> Result<bool, ConnError> {
-        let mut buf = [0u8; TCP_MSS];
+        let mut buf = uninit_buffer::<BUFFER_SIZE>();
 
         let Ok(count) = self.client.peek(buf.as_mut_slice()) else {
             return Ok(false);
@@ -264,7 +265,7 @@ impl<'a> Connection<'a> {
     }
 
     fn send(&mut self) -> Result<bool, ConnError> {
-        let mut buf = [0u8; TCP_MSS];
+        let mut buf = uninit_buffer::<BUFFER_SIZE>();
 
         let Ok(count) = self.client.read(buf.as_mut_slice()) else {
             return Ok(false);
@@ -289,13 +290,13 @@ impl<'a> Connection<'a> {
     }
 
     fn recv(&mut self) -> Result<bool, ConnError> {
-        let mut buf = [0u8; TCP_MSS];
+        let mut buf = uninit_buffer::<BUFFER_SIZE>();
 
         let Some(server) = &mut self.server else {
             E!(ConnError::Unknown);
         };
 
-        if match self.client.peek([0u8; 1].as_mut_slice()) {
+        if match self.client.peek(uninit_buffer::<1>().as_mut_slice()) {
             Ok(c) => c == 0,
             Err(e) => e.kind() != ErrorKind::WouldBlock,
         } {
@@ -314,6 +315,14 @@ impl<'a> Connection<'a> {
 
         self.client.write_all(&buf[..count])?;
         Ok(true)
+    }
+}
+
+fn uninit_buffer<const N: usize>() -> [u8; N] {
+    // SAFETY: uninitialized byte buffer should be fine
+    #[allow(clippy::uninit_assumed_init)]
+    unsafe {
+        MaybeUninit::uninit().assume_init()
     }
 }
 
