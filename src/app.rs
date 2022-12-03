@@ -17,7 +17,7 @@ const MAX_WORKER_THREADS: usize = 128;
 const WORKER_DELAY: Duration = Duration::from_millis(1);
 const BUFFER_SIZE: usize = 4096;
 const GET: &[u8] = b"GET";
-const HOST_HEADER: &str = "\nHost:";
+const HOST_HEADER: &str = "host:";
 
 pub type Hosts = HashSet<String>;
 
@@ -201,7 +201,7 @@ impl<'a> Connection<'a> {
             return Ok(false);
         };
 
-        let data = &buf[..count];
+        let data = &mut buf[..count];
 
         if !Self::check_http(data) {
             E!(ConnError::NotHttp);
@@ -217,20 +217,20 @@ impl<'a> Connection<'a> {
         (data.len() > GET.len()) && (&data[..GET.len()] == GET)
     }
 
-    fn resolve(&self, data: &[u8]) -> Result<SocketAddr, ConnError> {
+    fn resolve(&self, data: &mut [u8]) -> Result<SocketAddr, ConnError> {
         let host = {
-            let content = str::from_utf8(data)?;
+            let content = str::from_utf8_mut(data)?;
+            content.make_ascii_lowercase();
 
-            let s = match content.find(HOST_HEADER) {
-                Some(pos) => &content[(pos + HOST_HEADER.len())..],
-                _ => E!(ConnError::ParseError),
-            };
+            let line = content
+                .lines()
+                .map(|s| s.trim_start())
+                .find(|s| s.starts_with(HOST_HEADER));
 
-            match s.find('\n') {
-                Some(pos) => &s[..pos],
+            match line {
+                Some(s) => s[HOST_HEADER.len()..].trim(),
                 _ => E!(ConnError::ParseError),
             }
-            .trim()
         };
 
         if self.app.hosts.contains(host) {
