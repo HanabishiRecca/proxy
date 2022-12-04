@@ -259,7 +259,13 @@ impl<'a> Connection<'a> {
             E!(e);
         }
 
-        server.set_nodelay(true)?;
+        if let Err(e) = server.set_nodelay(true) {
+            if e.kind() == ErrorKind::InvalidInput {
+                return Ok(false);
+            }
+            E!(e);
+        }
+
         self.state = State::Send;
         Ok(true)
     }
