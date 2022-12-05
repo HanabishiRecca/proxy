@@ -5,9 +5,11 @@ edition = "2021"
 rust-version = "1.65"
 
 [profile.release]
-panic = 'abort'
-strip = 'symbols'
+panic = "abort"
+strip = true
 lto = true
+codegen-units = 1
+incremental = false
 
 [dependencies]
 mio = { version = "0.8", features = ["net", "os-poll"] }
