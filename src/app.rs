@@ -296,8 +296,6 @@ impl<'a> Connection<'a> {
     }
 
     fn recv(&mut self) -> Result<bool, ConnError> {
-        let mut buf = uninit_buffer::<BUFFER_SIZE>();
-
         let Some(server) = &mut self.server else {
             E!(ConnError::Unknown);
         };
@@ -309,6 +307,8 @@ impl<'a> Connection<'a> {
             self.state = State::Done;
             return Ok(true);
         }
+
+        let mut buf = uninit_buffer::<BUFFER_SIZE>();
 
         let Ok(count) = server.read(buf.as_mut_slice()) else {
             return Ok(false);
