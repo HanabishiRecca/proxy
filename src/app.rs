@@ -4,7 +4,10 @@ use std::{
     mem::MaybeUninit,
     net::{Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs},
     str,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        mpsc::{self, Receiver, RecvError, Sender},
+        Mutex, MutexGuard,
+    },
     thread,
     time::Duration,
 };
@@ -38,7 +41,7 @@ impl App {
         }
     }
 
-    pub fn start(&self, port: u16, worker_threads: usize) -> Result<(), AppError> {
+    pub fn start(&self, port: u16, mut worker_threads: usize) -> Result<(), AppError> {
         println!("Proxy: {}", self.proxy);
         println!();
         println!("Hosts:");
@@ -51,87 +54,94 @@ impl App {
         let server = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
         println!("Listen port: {port}");
 
-        let workers = {
-            let count = match worker_threads {
-                0 => match thread::available_parallelism() {
-                    Ok(n) => n.get(),
-                    _ => 1,
-                },
-                n => n,
-            }
-            .min(MAX_WORKER_THREADS);
+        worker_threads = match worker_threads {
+            0 => match thread::available_parallelism() {
+                Ok(n) => n.get(),
+                _ => 1,
+            },
+            n => n,
+        }
+        .min(MAX_WORKER_THREADS);
 
-            println!("Worker threads: {count}");
-            (0..count).map(|_| Worker::new(self)).collect::<Vec<_>>()
-        };
+        println!("Worker threads: {worker_threads}");
 
         thread::scope(|scope| {
-            for worker in &workers {
-                scope.spawn(move || worker.run());
-            }
+            let senders = (0..worker_threads)
+                .map(|_| {
+                    let (sender, receiver) = mpsc::channel();
+                    scope.spawn(move || Worker::new(self, receiver).run());
+                    sender
+                })
+                .collect::<Vec<_>>();
 
             loop {
-                for worker in &workers {
-                    Self::accept(&server, worker)?;
+                for sender in &senders {
+                    self.accept(&server, sender)?;
                 }
             }
         })
     }
 
-    fn accept(server: &TcpListener, worker: &Worker) -> Result<(), AppError> {
+    fn accept<'a>(
+        &'a self,
+        server: &TcpListener,
+        sender: &Sender<Connection<'a>>,
+    ) -> Result<(), AppError> {
         let (client, _) = server.accept()?;
         client.set_nonblocking(true)?;
         client.set_nodelay(true)?;
 
-        let Ok(mut connections) = worker.connections.lock() else {
-            E!(AppError::Unknown);
-        };
-
-        connections.push(Connection {
-            app: worker.app,
+        let connection = Connection {
+            app: self,
             client: TcpStream::from_std(client),
             server: None,
             state: State::Init,
-        });
+        };
 
-        Ok(())
+        sender.send(connection).map_err(|_| AppError::Unknown)
     }
 }
 
 struct Worker<'a> {
     app: &'a App,
-    connections: Mutex<Vec<Connection<'a>>>,
+    receiver: Receiver<Connection<'a>>,
+    connections: Vec<Connection<'a>>,
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(app: &'a App) -> Self {
+    pub fn new(app: &'a App, receiver: Receiver<Connection<'a>>) -> Self {
         Worker {
             app,
-            connections: Mutex::new(Vec::new()),
+            receiver,
+            connections: Vec::new(),
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         loop {
             thread::sleep(WORKER_DELAY);
-            self.handle_connections();
+
+            if let Err(e) = self.handle_connections() {
+                err(e);
+                return;
+            }
         }
     }
 
-    fn handle_connections(&self) {
-        let Ok(mut connections) = self.connections.try_lock() else {
-            return;
-        };
-
-        if connections.len() == 0 {
-            return;
+    fn handle_connections(&mut self) -> Result<(), RecvError> {
+        if self.connections.is_empty() {
+            self.connections.push(self.receiver.recv()?);
+        } else {
+            while let Ok(connection) = self.receiver.try_recv() {
+                self.connections.push(connection);
+            }
         }
 
         let mut index = 0;
 
-        while index < connections.len() {
+        while index < self.connections.len() {
             let done = {
-                let Some(connection) = connections.get_mut(index) else {
+                let Some(connection) = self.connections.get_mut(index) else {
                     break;
                 };
 
@@ -151,16 +161,18 @@ impl<'a> Worker<'a> {
                 continue;
             }
 
-            let Some(last) = connections.pop() else {
+            let Some(last) = self.connections.pop() else {
                 break;
             };
 
-            if index >= connections.len() {
+            if index >= self.connections.len() {
                 break;
             }
 
-            connections[index] = last;
+            self.connections[index] = last;
         }
+
+        Ok(())
     }
 }
 
