@@ -42,18 +42,6 @@ impl App {
     }
 
     pub fn start(&self, port: u16, mut worker_threads: usize) -> Result<(), AppError> {
-        println!("Proxy: {}", self.proxy);
-        println!();
-        println!("Hosts:");
-
-        for host in &self.hosts {
-            println!("  {host}");
-        }
-
-        println!();
-        let server = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
-        println!("Listen port: {port}");
-
         worker_threads = match worker_threads {
             0 => match thread::available_parallelism() {
                 Ok(n) => n.get(),
@@ -63,7 +51,22 @@ impl App {
         }
         .min(MAX_WORKER_THREADS);
 
-        println!("Worker threads: {worker_threads}");
+        let server = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
+
+        if self.debug {
+            println!("Proxy: {}", self.proxy);
+            println!();
+            println!("Hosts:");
+
+            for host in &self.hosts {
+                println!("  {host}");
+            }
+
+            println!();
+            println!("Worker threads: {worker_threads}");
+            println!("Listen port: {port}");
+            println!();
+        }
 
         thread::scope(|scope| {
             let senders = (0..worker_threads)
@@ -73,6 +76,9 @@ impl App {
                     sender
                 })
                 .collect::<Vec<_>>();
+
+            println!("Proxy is running.");
+            println!();
 
             loop {
                 for sender in &senders {
