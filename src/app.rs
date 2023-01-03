@@ -72,7 +72,7 @@ impl App {
             let senders = (0..worker_threads)
                 .map(|_| {
                     let (sender, receiver) = mpsc::channel();
-                    scope.spawn(move || Worker::new(self, receiver).run());
+                    scope.spawn(move || Worker::run(self, receiver));
                     sender
                 })
                 .collect::<Vec<_>>();
@@ -115,19 +115,17 @@ struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(app: &'a App, receiver: Receiver<Connection<'a>>) -> Self {
-        Worker {
+    pub fn run(app: &'a App, receiver: Receiver<Connection<'a>>) {
+        let mut worker = Worker {
             app,
             receiver,
             connections: Vec::new(),
-        }
-    }
+        };
 
-    pub fn run(&mut self) {
         loop {
             thread::sleep(WORKER_DELAY);
 
-            if let Err(e) = self.handle_connections() {
+            if let Err(e) = worker.handle_connections() {
                 err(e);
                 return;
             }
