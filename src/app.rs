@@ -32,16 +32,20 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(proxy: SocketAddr, hosts: Hosts, debug: bool) -> Self {
-        App {
+    pub fn start(
+        proxy: SocketAddr,
+        hosts: Hosts,
+        port: u16,
+        mut worker_threads: usize,
+        debug: bool,
+    ) -> Result<(), AppError> {
+        let app = &Self {
             proxy,
             hosts,
             debug,
             dns: Dns::new(),
-        }
-    }
+        };
 
-    pub fn start(&self, port: u16, mut worker_threads: usize) -> Result<(), AppError> {
         worker_threads = match worker_threads {
             0 => match thread::available_parallelism() {
                 Ok(n) => n.get(),
@@ -53,12 +57,12 @@ impl App {
 
         let server = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))?;
 
-        if self.debug {
-            println!("Proxy: {}", self.proxy);
+        if debug {
+            println!("Proxy: {}", proxy);
             println!();
             println!("Hosts:");
 
-            for host in &self.hosts {
+            for host in &app.hosts {
                 println!("  {host}");
             }
 
@@ -72,7 +76,7 @@ impl App {
             let senders = (0..worker_threads)
                 .map(|_| {
                     let (sender, receiver) = mpsc::channel();
-                    scope.spawn(move || Worker::run(self, receiver));
+                    scope.spawn(move || Worker::run(app, receiver));
                     sender
                 })
                 .collect::<Vec<_>>();
@@ -82,7 +86,7 @@ impl App {
 
             loop {
                 for sender in &senders {
-                    self.accept(&server, sender)?;
+                    app.accept(&server, sender)?;
                 }
             }
         })
@@ -116,7 +120,7 @@ struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     pub fn run(app: &'a App, receiver: Receiver<Connection<'a>>) {
-        let mut worker = Worker {
+        let mut worker = Self {
             app,
             receiver,
             connections: Vec::new(),

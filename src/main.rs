@@ -70,6 +70,6 @@ fn start() -> Result<(), MainError> {
         E!(ArgError::NoHosts);
     }
 
-    App::new(proxy, hosts, debug).start(listen_port, worker_threads)?;
+    App::start(proxy, hosts, listen_port, worker_threads, debug)?;
     Ok(())
 }
