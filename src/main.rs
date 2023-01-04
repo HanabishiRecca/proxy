@@ -48,7 +48,7 @@ fn start() -> Result<(), MainError> {
                 listen_port = parse!(next!().parse());
             }
             "-h" => {
-                hosts = next!().split(',').map(|s| s.trim().to_owned()).collect();
+                hosts.extend(next!().split(',').map(|s| s.trim().to_owned()));
             }
             "-t" => {
                 worker_threads = parse!(next!().parse());
