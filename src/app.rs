@@ -47,10 +47,7 @@ impl App {
         };
 
         worker_threads = match worker_threads {
-            0 => match thread::available_parallelism() {
-                Ok(n) => n.get(),
-                _ => 1,
-            },
+            0 => thread::available_parallelism().map_or(1, |n| n.get()),
             n => n,
         }
         .min(MAX_WORKER_THREADS);
@@ -148,25 +145,20 @@ impl<'a> Worker<'a> {
         let mut index = 0;
 
         while index < self.connections.len() {
-            let done = {
-                let Some(connection) = self.connections.get_mut(index) else {
-                    break;
-                };
-
-                match connection.progress() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        if self.app.debug {
-                            err(e);
-                        }
-                        true
+            if let Some(connection) = self.connections.get_mut(index) {
+                let done = connection.progress().unwrap_or_else(|e| {
+                    if self.app.debug {
+                        err(e);
                     }
-                }
-            };
+                    true
+                });
 
-            if !done {
-                index += 1;
-                continue;
+                if !done {
+                    index += 1;
+                    continue;
+                }
+            } else {
+                break;
             }
 
             let Some(last) = self.connections.pop() else {
@@ -223,34 +215,25 @@ impl<'a> Connection<'a> {
 
         let data = &mut buf[..count];
 
-        if !Self::check_http(data) {
+        if !check_http(data) {
             E!(ConnError::NotHttp);
         }
 
-        let server = TcpStream::connect(self.resolve(data)?)?;
-        self.server = Some(server);
+        self.server = Some(TcpStream::connect(self.resolve(data)?)?);
         self.state = State::Conn;
         Ok(true)
-    }
-
-    fn check_http(data: &[u8]) -> bool {
-        (data.len() > GET.len()) && (&data[..GET.len()] == GET)
     }
 
     fn resolve(&self, data: &mut [u8]) -> Result<SocketAddr, ConnError> {
         let host = {
             let content = str::from_utf8_mut(data)?;
             content.make_ascii_lowercase();
-
-            let line = content
+            content
                 .lines()
                 .map(|s| s.trim_start())
-                .find(|s| s.starts_with(HOST_HEADER));
-
-            match line {
-                Some(s) => s[HOST_HEADER.len()..].trim(),
-                _ => E!(ConnError::ParseError),
-            }
+                .find(|s| s.starts_with(HOST_HEADER))
+                .ok_or(ConnError::ParseError)?[HOST_HEADER.len()..]
+                .trim()
         };
 
         if self.app.hosts.contains(host) {
@@ -268,9 +251,7 @@ impl<'a> Connection<'a> {
     }
 
     fn connect(&mut self) -> Result<bool, ConnError> {
-        let Some(server) = &self.server else {
-            E!(ConnError::Unknown);
-        };
+        let server = self.server.as_mut().ok_or(ConnError::Unknown)?;
 
         if let Err(e) = server.peer_addr() {
             if matches!(e.kind(), ErrorKind::NotConnected | ErrorKind::WouldBlock) {
@@ -302,11 +283,10 @@ impl<'a> Connection<'a> {
             return Ok(true);
         }
 
-        let Some(server) = &mut self.server else {
-            E!(ConnError::Unknown);
-        };
-
-        server.write_all(&buf[..count])?;
+        self.server
+            .as_mut()
+            .ok_or(ConnError::Unknown)?
+            .write_all(&buf[..count])?;
 
         if count < buf.len() {
             self.state = State::Recv;
@@ -316,10 +296,6 @@ impl<'a> Connection<'a> {
     }
 
     fn recv(&mut self) -> Result<bool, ConnError> {
-        let Some(server) = &mut self.server else {
-            E!(ConnError::Unknown);
-        };
-
         if match self.client.peek(uninit_buffer::<1>().as_mut_slice()) {
             Ok(c) => c == 0,
             Err(e) => e.kind() != ErrorKind::WouldBlock,
@@ -330,9 +306,12 @@ impl<'a> Connection<'a> {
 
         let mut buf = uninit_buffer::<BUFFER_SIZE>();
 
-        let Ok(count) = server.read(buf.as_mut_slice()) else {
-            return Ok(false);
-        };
+        let Ok(count) = self
+            .server
+            .as_mut()
+            .ok_or(ConnError::Unknown)?
+            .read(buf.as_mut_slice())
+            else { return Ok(false); };
 
         if count == 0 {
             self.state = State::Done;
@@ -342,6 +321,10 @@ impl<'a> Connection<'a> {
         self.client.write_all(&buf[..count])?;
         Ok(true)
     }
+}
+
+fn check_http(data: &[u8]) -> bool {
+    (data.len() > GET.len()) && (&data[..GET.len()] == GET)
 }
 
 fn uninit_buffer<const N: usize>() -> [u8; N] {
@@ -370,15 +353,14 @@ impl Dns {
             return Ok(*cached);
         }
 
-        let Ok(mut resolved) = ({
+        let mut resolved = {
             let v6 = host.starts_with('[');
             if (v6 && host.contains("]:")) || (!v6 && host.contains(':')) {
                 host.to_socket_addrs()
             } else {
                 (host, 80).to_socket_addrs()
             }
-        }) else {
-            E!(ConnError::DnsError);
+            .map_err(|_| ConnError::DnsError)?
         };
 
         if let Some(addr) = resolved.next() {

@@ -6,12 +6,11 @@ mod app;
 use app::*;
 
 fn main() -> ExitCode {
-    match start() {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            err(e);
-            ExitCode::FAILURE
-        }
+    if let Err(e) = start() {
+        err(e);
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -62,9 +61,7 @@ fn start() -> Result<(), MainError> {
         }
     }
 
-    let Some(proxy) = proxy else {
-        E!(ArgError::NoProxy);
-    };
+    let proxy = proxy.ok_or(ArgError::NoProxy)?;
 
     if hosts.is_empty() {
         E!(ArgError::NoHosts);
