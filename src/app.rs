@@ -6,7 +6,7 @@ use std::{
     str,
     sync::{
         mpsc::{self, Receiver, RecvError, Sender},
-        Mutex, MutexGuard,
+        RwLock,
     },
     thread,
     time::Duration,
@@ -338,18 +338,18 @@ fn uninit_buffer<const N: usize>() -> [u8; N] {
 type DnsCache = HashMap<String, SocketAddr>;
 
 struct Dns {
-    cache: Mutex<DnsCache>,
+    cache: RwLock<DnsCache>,
 }
 
 impl Dns {
     pub fn new() -> Self {
         Dns {
-            cache: Mutex::new(HashMap::new()),
+            cache: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn resolve(&self, host: &str) -> Result<SocketAddr, ConnError> {
-        if let Some(cached) = self.cache()?.get(host) {
+        if let Some(cached) = self.cache.read().map_err(|_| ConnError::Unknown)?.get(host) {
             return Ok(*cached);
         }
 
@@ -364,17 +364,13 @@ impl Dns {
         };
 
         if let Some(addr) = resolved.next() {
-            self.cache()?.insert(host.to_owned(), addr);
+            self.cache
+                .write()
+                .map_err(|_| ConnError::Unknown)?
+                .insert(host.to_owned(), addr);
             return Ok(addr);
         }
 
         E!(ConnError::DnsError);
-    }
-
-    fn cache(&self) -> Result<MutexGuard<DnsCache>, ConnError> {
-        match self.cache.lock() {
-            Ok(c) => Ok(c),
-            _ => E!(ConnError::Unknown),
-        }
     }
 }
